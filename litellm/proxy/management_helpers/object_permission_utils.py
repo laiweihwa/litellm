@@ -590,29 +590,98 @@ async def validate_key_mcp_servers_against_team(
                 detail={"error": detail},
             )
 
-    # Validate requested toolsets against team's allowed toolsets.
-    # Only enforce the team-based restriction when a team is present — standalone
-    # keys (no team) can freely be granted any toolset by an admin.
-    if requested_toolsets and team_obj is not None:
-        team_op = team_obj.object_permission
-        team_mcp_toolsets = team_op.mcp_toolsets if team_op is not None else None
-        # None or [] means the team has no toolset restriction — allow any toolsets.
-        if team_mcp_toolsets:
-            disallowed_toolsets = requested_toolsets - set(team_mcp_toolsets)
-            if disallowed_toolsets:
-                team_id = team_obj.team_id
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail={
-                        "error": (
-                            f"Key requests MCP toolsets not allowed by team '{team_id}': "
-                            f"{sorted(disallowed_toolsets)}. "
-                            f"Team allows: {sorted(team_mcp_toolsets)}."
-                        )
-                    },
-                )
+    _validate_requested_toolsets(
+        requested_toolsets=requested_toolsets,
+        team_obj=team_obj,
+        is_proxy_admin=is_proxy_admin,
+    )
 
     return object_permission
+
+
+def _validate_requested_toolsets(
+    requested_toolsets: set[str],
+    team_obj: Optional["LiteLLM_TeamTableCachedObj"],
+    is_proxy_admin: bool,
+) -> None:
+    """
+    Reject toolsets stapled to a personal (non-team) key by a non-admin caller
+    (VERIA-218); the toolset row has no team scope so a self-stamped ID grants
+    tool-level MCP access without an ownership check. Team keys keep the
+    existing subset check against the team's own toolset allowlist.
+    """
+    if not requested_toolsets:
+        return
+    if team_obj is None:
+        if is_proxy_admin:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": (
+                    "Key is not in a team. MCP toolsets cannot be assigned to "
+                    "personal keys by non-admin callers. Disallowed toolsets: "
+                    f"{sorted(requested_toolsets)}."
+                )
+            },
+        )
+    team_op = team_obj.object_permission
+    team_mcp_toolsets = team_op.mcp_toolsets if team_op is not None else None
+    if not team_mcp_toolsets:
+        return
+    disallowed_toolsets = requested_toolsets - set(team_mcp_toolsets)
+    if not disallowed_toolsets:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "error": (
+                f"Key requests MCP toolsets not allowed by team '{team_obj.team_id}': "
+                f"{sorted(disallowed_toolsets)}. "
+                f"Team allows: {sorted(team_mcp_toolsets)}."
+            )
+        },
+    )
+
+
+def _extract_requested_vector_stores(object_permission: Optional[dict]) -> set[str]:
+    """Return vector_store IDs from a key's object_permission dict."""
+    if not object_permission or not isinstance(object_permission, dict):
+        return set()
+    raw = object_permission.get("vector_stores")
+    if isinstance(raw, list):
+        return {str(x) for x in raw if x}
+    return set()
+
+
+async def validate_key_vector_stores_against_team(
+    object_permission: Optional[dict],
+    team_obj: Optional["LiteLLM_TeamTableCachedObj"],
+    is_proxy_admin: bool = False,
+) -> None:
+    """
+    Reject vector_stores stapled to a personal (non-team) key by a non-admin caller.
+
+    Vector store access is granted at use-time if the ID appears in the key's
+    object_permission.vector_stores list, so allowing a personal-key caller to
+    self-stamp arbitrary IDs is direct cross-tenant escalation (VERIA-218).
+    Team keys retain their existing trust model; admins keep the LIT-3815 carve-out.
+    """
+    requested = _extract_requested_vector_stores(object_permission)
+    if not requested:
+        return
+    if team_obj is not None or is_proxy_admin:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "error": (
+                "Key is not in a team. Vector stores cannot be assigned to "
+                "personal keys by non-admin callers. Disallowed vector stores: "
+                f"{sorted(requested)}."
+            )
+        },
+    )
 
 
 def _extract_requested_search_tools(object_permission: Optional[dict]) -> List[str]:
@@ -628,15 +697,29 @@ def _extract_requested_search_tools(object_permission: Optional[dict]) -> List[s
 async def validate_key_search_tools_against_team(
     object_permission: Optional[dict],
     team_obj: Optional["LiteLLM_TeamTableCachedObj"],
+    is_proxy_admin: bool = False,
 ) -> None:
     """
     Validate key object_permission.search_tools is a subset of the team's allowlist.
 
     Empty team allowlist means no restriction at team layer (skip).
+    Non-admin personal-key callers cannot self-assign search_tools (VERIA-218).
     """
     requested = _extract_requested_search_tools(object_permission)
     if not requested:
         return
+
+    if team_obj is None and not is_proxy_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": (
+                    "Key is not in a team. search_tools cannot be assigned to "
+                    "personal keys by non-admin callers. Disallowed search tools: "
+                    f"{sorted(requested)}."
+                )
+            },
+        )
 
     team_tools: List[str] = []
     if team_obj is not None and team_obj.object_permission is not None:
